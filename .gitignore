@@ -1,0 +1,48 @@
+# === 数据与大数据文件 ===
+# 忽略 COMAP 竞赛数据集文件夹
+rag_service/COMAP/
+# 忽略所有大型 CSV/Excel/数据文件 (如果需要特定 CSV，请使用 ! 加回)
+*.csv
+*.xlsx
+*.parquet
+
+# === 环境与配置 ===
+.env
+.venv/
+env/
+venv/
+ENV/
+.python-version
+
+# === Python 缓存与产物 ===
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.egg-info/
+dist/
+build/
+.coverage
+htmlcov/
+
+# === 数据库与临时文件 ===
+*.db
+*.db-journal
+*.db-wal
+*.sqlite3
+rag_service/chroma_db/
+tmp/
+backend/uploads/
+rag_service/RAG_Chunks_Gemini/
+rag_service/RAG_Output_Gemini/
+
+# === IDE 与 系统文件 ===
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.log
