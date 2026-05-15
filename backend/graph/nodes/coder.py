@@ -1,13 +1,16 @@
-import os
 import re
 import json
 import asyncio
+import os
+from pathlib import Path
+from typing import Any, Dict, List
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage
 from backend.graph.state import AgentState
 from backend.services.bus import broadcast_progress
 from backend.services.sandbox import execute_python_code
+from backend.services.serialization import extract_text_content, json_safe, ensure_blocks, make_stage
 
 class CoderNode:
     """
@@ -22,13 +25,90 @@ class CoderNode:
             "核心准则：\n"
             "1. **自主可视化**：只要涉及数据分布、模型拟合或结果对比，必须自主决定绘制图表。\n"
             "2. **科学审美**：图表使用 `seaborn` 风格，必须包含标题、标签与图例。\n"
-            "3. **静态保存**：必须将图表保存至 `backend/static/plots/output.png`。\n"
-            "4. **技术栈**：优先使用 numpy, pandas, scipy, matplotlib, seaborn, pulp 等。\n"
+            "3. **动态产物输出**：根据前序节点结果动态决定需要产出的实验资产；"
+            "可输出多算法代码、多张图、多份结果文件，而不是固定单图。\n"
+            "4. **产物落盘规范**：图像保存到 `backend/static/plots/`，表格/结果保存到 `backend/static/exports/`。\n"
+            "5. **图表规划驱动**：若输入包含 CHART_PLAN，则必须先按计划决定输出图表，而不是固定单图。\n"
+            "   - 必须尝试覆盖高优先级图表项；无法覆盖时给出替代图并说明原因。\n"
+            "   - 对于流程/思路相关任务，必须输出流程图或思路网络图（可用 matplotlib/networkx）。\n"
+            "6. **技术栈**：优先使用 numpy, pandas, matplotlib, seaborn, pulp。除非绝对必要，不要依赖 scipy。\n"
             "5. **输出格式**：将唯一要执行的代码块用 ```python 和 ``` 包裹起来。\n\n"
             "【特别指令】\n"
             "- **代码学术性**：参考 RAG 背景中优秀论文展示的数据处理逻辑与算法实现深度。代码注释应当体现建模逻辑，而不仅仅是代码功能。\n"
-            "- **版权保护约束**：严禁在生成内容或注释中提及参考资料的具体队号、年份或获奖等级。保护数据隐私。"
+            "- **沙箱兼容**：若出现 `No module named scipy`，请立即改写为仅用 numpy/pandas 的等价实现；`rankdata` 请用 pandas 的 `Series.rank()` 替代。\n"
+            "- **文风强制要求**：语言和文字风格要符合各个获奖论文严谨冷静的范式，不要使用对表达论文内容来说不必要的比喻以及其他修辞，也不要使用过于抽象的合成词语或者自造词语"
         )
+
+    def _chart_plan_text(self, chart_plan: Any) -> str:
+        if not isinstance(chart_plan, list) or not chart_plan:
+            return "[]"
+        try:
+            return json.dumps(chart_plan, ensure_ascii=False, indent=2)
+        except Exception:
+            return "[]"
+
+    def _artifact_roots(self) -> Dict[str, Path]:
+        base = Path(os.path.abspath(os.getcwd()))
+        return {
+            "plot": base / "backend" / "static" / "plots",
+            "export": base / "backend" / "static" / "exports",
+        }
+
+    def _snapshot_artifacts(self) -> Dict[str, Dict[str, Any]]:
+        snap: Dict[str, Dict[str, Any]] = {}
+        for _kind, root in self._artifact_roots().items():
+            if not root.exists():
+                continue
+            for file_path in root.rglob("*"):
+                if not file_path.is_file():
+                    continue
+                try:
+                    stat = file_path.stat()
+                except OSError:
+                    continue
+                key = str(file_path.resolve())
+                snap[key] = {"mtime_ns": int(stat.st_mtime_ns), "size": int(stat.st_size)}
+        return snap
+
+    def _build_artifact_manifest(
+        self,
+        before: Dict[str, Dict[str, Any]],
+        after: Dict[str, Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        roots = self._artifact_roots()
+        manifest: List[Dict[str, Any]] = []
+        for abs_path, after_meta in after.items():
+            before_meta = before.get(abs_path)
+            if before_meta == after_meta:
+                continue
+            path_obj = Path(abs_path)
+            kind = "file"
+            url = ""
+            try:
+                rel = path_obj.relative_to(roots["plot"]).as_posix()
+                kind = "image"
+                url = f"/plots/{rel}"
+            except ValueError:
+                try:
+                    rel = path_obj.relative_to(roots["export"]).as_posix()
+                    kind = "export"
+                    url = f"/exports/{rel}"
+                except ValueError:
+                    pass
+            if kind == "file" and path_obj.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"}:
+                kind = "image"
+            manifest.append(
+                {
+                    "kind": kind,
+                    "path": str(path_obj),
+                    "filename": path_obj.name,
+                    "size": int(after_meta.get("size", 0)),
+                    "updated_at_ns": int(after_meta.get("mtime_ns", 0)),
+                    "url": url,
+                }
+            )
+        manifest.sort(key=lambda item: int(item.get("updated_at_ns", 0)), reverse=True)
+        return manifest
 
     def _extract_code(self, text: str) -> str:
         """从 LLM 输出中提取第一个 Python 代码块"""
@@ -41,19 +121,25 @@ class CoderNode:
     async def __call__(self, state: AgentState):
         """执行代码生成逻辑实现"""
         shared_mem = state.get("shared_memory", {})
-        doc_content = shared_mem.get("raw_document_content", "")
-        analysis = shared_mem.get("analysis_report", "")
+        doc_content = extract_text_content(shared_mem.get("raw_document_content", ""))
+        analysis = extract_text_content(shared_mem.get("analysis_report", ""))
+        rag_context = extract_text_content(state.get("context", ""))
+        fusion_guidance = extract_text_content(shared_mem.get("fusion_guidance", ""))
+        fusion_chart_plan = shared_mem.get("fusion_chart_plan", [])
         feedback = state.get("human_feedback", "")
         
         await broadcast_progress("Coder", "正在准备仿真环境与算法指令...", 10)
         
         # 1.5. 动态模型实例化 (从任务配置加载)
         api_key = shared_mem.get("api_key")
-        model_id = shared_mem.get("model_id") or "gemini-2.5-flash"
+        model_id = shared_mem.get("model_id") or "gemini-2.5-flash-lite"
         
         if not api_key:
-            print("[Warning] No API key found in shared_memory. Falling back to environment variable.")
-            api_key = os.environ.get("GOOGLE_API_KEY")
+            return {
+                "status": "REJECTED",
+                "human_feedback": "缺少任务 API Key，Coder 节点无法执行。",
+                "stage": make_stage("coder_failed_missing_api_key", "Coder Failed: Missing Task API Key"),
+            }
 
         llm = ChatGoogleGenerativeAI(
             model=model_id,
@@ -61,11 +147,23 @@ class CoderNode:
             google_api_key=api_key
         )
         
-        # 构造执行背景 (如果存在 RAG context, 注入到 prompt)
-        rag_context = state.get("context", "")
-        context = f"【赛题】\n{doc_content[:1000]}...\n\n【模型思路】\n{analysis[:1000]}..."
+        # 构造执行背景 (转义花括号以防 LaTeX/代码 干扰 LangChain)
+        safe_doc = doc_content[:1000].replace("{", "{{").replace("}", "}}")
+        safe_analysis = analysis[:1000].replace("{", "{{").replace("}", "}}")
+        context = f"【赛题】\n{safe_doc}...\n\n【模型思路】\n{safe_analysis}..."
+        if fusion_guidance:
+            safe_fusion = fusion_guidance[:2600].replace("{", "{{").replace("}", "}}")
+            context += f"\n\n【Fusion 强约束】\n{safe_fusion}"
+        if fusion_chart_plan:
+            chart_plan_text = self._chart_plan_text(fusion_chart_plan).replace("{", "{{").replace("}", "}}")
+            context += (
+                "\n\n【CHART_PLAN（必须优先执行）】\n"
+                f"{chart_plan_text}\n"
+                "执行要求：高优先级图表优先，生成文件名建议采用 <chart_id>.png。"
+            )
         if rag_context:
-            context += f"\n\n【RAG 参考代码风格资料】\n{rag_context[:2000]}"
+            safe_rag = rag_context[:2000].replace("{", "{{").replace("}", "}}")
+            context += f"\n\n【RAG 参考代码风格资料】\n{safe_rag}"
         
         prompt_parts = [
             ("system", self.system_prompt),
@@ -76,11 +174,10 @@ class CoderNode:
             
         alignment_record = shared_mem.get("alignment_record", {})
         if alignment_record:
+            align_data = json.dumps(alignment_record, ensure_ascii=False, indent=2).replace("{", "{{").replace("}", "}}")
             align_prompt = (
                 f"【全局防漂移强制对齐约束 (CRITICAL)】\n"
-                f"1. 强制使用以下全局符号体系，严禁在代码中定义与数学推导意义冲突的变量名：\n{json.dumps(alignment_record.get('symbols', []), ensure_ascii=False, indent=2)}\n"
-                f"2. 严禁违背以下全局预设简化假设：\n{json.dumps(alignment_record.get('assumptions', []), ensure_ascii=False, indent=2)}\n"
-                f"3. 核心计算算法与迭代循环必须紧密朝向以下核心优化目标：\n{json.dumps(alignment_record.get('objectives', []), ensure_ascii=False, indent=2)}"
+                f"{align_data}"
             )
             prompt_parts.append(("system", align_prompt))
             
@@ -90,8 +187,11 @@ class CoderNode:
         current_attempt = 0
         success = False
         final_code = ""
-        final_response = None
+        final_response_text = ""
+        final_raw_content = None
         execution_logs = {}
+        manifest: List[Dict[str, Any]] = []
+        before_snapshot = self._snapshot_artifacts()
         
         # 当前的对话历史拷贝
         current_messages = list(state["messages"])
@@ -112,9 +212,10 @@ class CoderNode:
             # TODO: Token 流监听会在第一次 ainvoke 时由 main.py 正常拦截
             # 后续的重试属于内部调用，流可能无法直接推送给前端，但状态会广播
             response = await chain.ainvoke({"messages": current_messages})
-            final_response = response
+            final_raw_content = getattr(response, "content", None)
+            generated_text = extract_text_content(response)
+            final_response_text = generated_text
             
-            generated_text = response.content
             extracted_code = self._extract_code(generated_text)
             
             if not extracted_code:
@@ -132,15 +233,48 @@ class CoderNode:
             
             if exec_result["success"]:
                 success = True
-                await broadcast_progress("Coder", "沙箱执行成功，图表及计算结果已生成！", progress_val + 15)
+                after_snapshot = self._snapshot_artifacts()
+                manifest = self._build_artifact_manifest(before_snapshot, after_snapshot)
+                if not manifest:
+                    fallback_plot = self._artifact_roots()["plot"] / "output.png"
+                    if fallback_plot.exists():
+                        manifest = [
+                            {
+                                "kind": "image",
+                                "path": str(fallback_plot),
+                                "filename": fallback_plot.name,
+                                "size": int(fallback_plot.stat().st_size),
+                                "updated_at_ns": int(fallback_plot.stat().st_mtime_ns),
+                                "url": "/plots/output.png",
+                            }
+                        ]
+                artifact_urls = [str(item.get("url", "")) for item in manifest if item.get("url")]
+                image_urls = [str(item.get("url", "")) for item in manifest if item.get("kind") == "image" and item.get("url")]
+                primary_url = image_urls[0] if image_urls else (artifact_urls[0] if artifact_urls else None)
+                await broadcast_progress(
+                    "Coder",
+                    "沙箱执行成功，已根据任务上下文动态产出实验资产。",
+                    progress_val + 15,
+                    artifact_url=primary_url,
+                    artifact_urls=artifact_urls or None,
+                    artifact_manifest=manifest or None,
+                )
             else:
                 stderr_preview = exec_result["stderr"][:1000]
                 await broadcast_progress("Coder", "沙箱执行失败！正在提取 Traceback 自我修复...", progress_val + 15)
                 
-                # 构造自我纠错消息
+                # 构造自我纠错消息 (转义报错信息中的可能的花括号)
+                safe_stderr = stderr_preview.replace("{", "{{").replace("}", "}}")
+                extra_hint = ""
+                if "No module named 'scipy'" in stderr_preview or 'No module named "scipy"' in stderr_preview:
+                    extra_hint = (
+                        "\n额外要求：当前环境缺少 scipy，请你完全移除 scipy 依赖，"
+                        "用 numpy/pandas 实现同等功能（例如 rankdata -> pandas.Series.rank）。\n"
+                    )
                 error_feedback = (
                     f"代码执行失败，错误信息（Traceback）如下：\n"
-                    f"```text\n{stderr_preview}\n```\n"
+                    f"```text\n{safe_stderr}\n```\n"
+                    f"{extra_hint}"
                     f"请分析错误原因，并输出修正后的完整 Python 代码（必须包含 ```python 包裹）。"
                 )
                 
@@ -154,15 +288,45 @@ class CoderNode:
         new_memory = shared_mem.copy()
         new_memory["generated_code"] = final_code
         new_memory["execution_logs"] = execution_logs
+        new_memory["coder_raw_content"] = json_safe(final_raw_content)
+        if isinstance(fusion_chart_plan, list):
+            new_memory["coder_chart_plan"] = json_safe(fusion_chart_plan)
+        if execution_logs.get("success") and not manifest:
+            after_snapshot = self._snapshot_artifacts()
+            manifest = self._build_artifact_manifest(before_snapshot, after_snapshot)
+        if execution_logs.get("success") and not manifest:
+            fallback_plot = self._artifact_roots()["plot"] / "output.png"
+            if fallback_plot.exists():
+                manifest = [
+                    {
+                        "kind": "image",
+                        "path": str(fallback_plot),
+                        "filename": fallback_plot.name,
+                        "size": int(fallback_plot.stat().st_size),
+                        "updated_at_ns": int(fallback_plot.stat().st_mtime_ns),
+                        "url": "/plots/output.png",
+                    }
+                ]
+        artifact_urls = [str(item.get("url", "")) for item in manifest if item.get("url")]
+        image_urls = [str(item.get("url", "")) for item in manifest if item.get("kind") == "image" and item.get("url")]
+        artifact_url = image_urls[0] if image_urls else (artifact_urls[0] if artifact_urls else None)
+        new_memory["artifacts_manifest"] = json_safe(manifest)
         
-        await broadcast_progress("Coder", "执行日志已注入共享内存，进入审计环节。", 100)
+        await broadcast_progress(
+            "Coder",
+            "执行日志已注入共享内存，进入审计环节。",
+            100,
+            artifact_url=artifact_url,
+            artifact_urls=artifact_urls or None,
+            artifact_manifest=manifest or None,
+        )
         
         return {
-            "messages": [final_response],
+            "messages": [{"role": "ai", "content": ensure_blocks(final_response_text or final_code)}],
             "shared_memory": new_memory,
             "status": "PENDING",
-            "draft": final_response.content if final_response else final_code,
-            "current_stage": "Code Implementation & Sandbox Execution Completed"
+            "draft": ensure_blocks(final_response_text or final_code),
+            "stage": make_stage("coding_completed", "Code Implementation & Sandbox Execution Completed"),
         }
 
 coder_node = CoderNode()

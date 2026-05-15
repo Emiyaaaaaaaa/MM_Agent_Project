@@ -23,6 +23,9 @@ matplotlib = "^3.10.8"
 seaborn = "^0.13.2"
 sqlalchemy = "^2.0.38"
 email-validator = "^2.2.0"
+passlib = {extras = ["cryptography"], version = "^1.7.4"}
+bcrypt = "4.0.1"
+aiosqlite = "^0.22.1"
 
 [build-system]
 requires = ["poetry-core"]

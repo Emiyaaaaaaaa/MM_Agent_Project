@@ -1,6 +1,13 @@
-from typing import Annotated, Sequence, TypedDict, Literal, Dict, Any
+from typing import Annotated, Sequence, TypedDict, Literal, Dict, Any, List
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
+
+
+class StageState(TypedDict):
+    id: str
+    label: str
+    meta: Dict[str, Any]
+
 
 class AgentState(TypedDict):
     """
@@ -19,10 +26,10 @@ class AgentState(TypedDict):
     # HITL (人机协作) 审批字段
     status: Literal["PENDING", "APPROVED", "REJECTED"] # 执行状态：待定/通过/驳回
     human_feedback: str                             # 用户反馈/修正建议
-    draft: str                                      # 节点的中间草稿或执行结果预览
+    draft: List[Dict[str, Any]]                     # 节点中间产物（结构化内容块）
     
     # 全局共享记忆体：持久化存储各阶段的核心产物 (Report, Python Code, Latex, etc.)
     shared_memory: Dict[str, Any]
     
-    # 阶段描述符：用于前端 UI 展示当前的逻辑位置
-    current_stage: str
+    # 阶段描述符：结构化阶段信息
+    stage: StageState

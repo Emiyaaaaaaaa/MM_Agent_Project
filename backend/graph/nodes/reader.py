@@ -8,6 +8,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 from backend.graph.state import AgentState
 from backend.services.bus import broadcast_progress
+from backend.services.serialization import extract_text_content, make_stage
 
 async def parse_pdf_with_vision(pdf_path: str, llm) -> str:
     """使用 Gemini Vision 逐页渲染 PDF 并提取高保真 Markdown (含 LaTeX)"""
@@ -42,7 +43,7 @@ async def parse_pdf_with_vision(pdf_path: str, llm) -> str:
             )
             
             response = await llm.ainvoke([message])
-            full_markdown.append(response.content.strip())
+            full_markdown.append(extract_text_content(response).strip())
             
         return "\n\n---\n\n".join(full_markdown)
     except Exception as e:
@@ -74,15 +75,22 @@ async def reader_node(state: AgentState):
     file_path = shared_mem.get("input_file_path")
     
     if not file_path:
-        return {"status": "REJECTED", "human_feedback": "缺少 'input_file_path'，请上传文件。"}
+        return {
+            "status": "REJECTED",
+            "human_feedback": "缺少 'input_file_path'，请上传文件。",
+            "stage": make_stage("reader_failed_missing_input_file", "Reader Failed: Missing input_file_path"),
+        }
     
     # 动态模型实例化 (从任务配置加载)
     api_key = shared_mem.get("api_key")
     model_id = shared_mem.get("model_id") or "gemini-2.5-flash"
     
     if not api_key:
-        print("[Warning] No API key found in shared_memory for Reader. Falling back to environment variable.")
-        api_key = os.environ.get("GOOGLE_API_KEY")
+        return {
+            "status": "REJECTED",
+            "human_feedback": "缺少任务 API Key，Reader 无法调用模型。",
+            "stage": make_stage("reader_failed_missing_api_key", "Reader Failed: Missing Task API Key"),
+        }
     
     llm = ChatGoogleGenerativeAI(model=model_id, google_api_key=api_key)
     
@@ -90,7 +98,11 @@ async def reader_node(state: AgentState):
     
     ext = Path(file_path).suffix.lower()
     if ext not in allowed_exts:
-        return {"status": "REJECTED", "human_feedback": f"格式不支持 ({ext})"}
+        return {
+            "status": "REJECTED",
+            "human_feedback": f"格式不支持 ({ext})",
+            "stage": make_stage("reader_failed_unsupported_file", "Reader Failed: Unsupported file"),
+        }
 
     if ext == ".pdf":
         # 强制 PDF 使用多模态视觉解析以确保公式准确性
@@ -111,7 +123,7 @@ async def reader_node(state: AgentState):
         "shared_memory": new_memory,
         "status": "APPROVED",
         "next": "Supervisor",
-        "current_stage": "File Content Fully Loaded (Multi-modal Enabled)"
+        "stage": make_stage("reader_completed", "File Content Fully Loaded (Multi-modal Enabled)"),
     }
 
 reader_node = reader_node  # 导出

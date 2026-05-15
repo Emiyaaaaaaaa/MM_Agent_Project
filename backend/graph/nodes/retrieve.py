@@ -2,6 +2,7 @@ import json
 from langchain_core.messages import HumanMessage
 from backend.services.rag_engine import rag_engine
 from backend.graph.state import AgentState
+from backend.services.serialization import extract_text_content, make_stage
 
 def retrieve_node(state: AgentState):
     """
@@ -13,7 +14,8 @@ def retrieve_node(state: AgentState):
     api_key = shared_mem.get("api_key")
     
     # 提取最后一条提问作为 RAG 查询词
-    last_message = messages[-1].content
+    messages = state.get("messages", [])
+    last_message = extract_text_content(messages[-1]) if messages else ""
     
     # 执行 RAG 检索 (传入动态 api_key)
     search_results = rag_engine.search(last_message, n_results=5, api_key=api_key)
@@ -37,5 +39,5 @@ def retrieve_node(state: AgentState):
     
     return {
         "context": full_context,
-        "current_stage": "Knowledge Retrieval Completed"
+        "stage": make_stage("retrieve_completed", "Knowledge Retrieval Completed"),
     }

@@ -1,14 +1,16 @@
-import os
 import json
+import logging
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from pathlib import Path
 import chromadb
 from google import genai
 from google.genai import types
-from dotenv import load_dotenv
+from backend.services.serialization import extract_text_content
 
-# 加载父目录中的 .env
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
-load_dotenv(BASE_DIR / ".env")
+logger = logging.getLogger("mm-agent")
 
 class RAGService:
     """
@@ -22,6 +24,7 @@ class RAGService:
         self.db_path = self.project_root / "rag_service" / "chroma_db"
         self.collection_name = "multimodal_papers"
         self.embedding_model = "gemini-embedding-2-preview"
+        self.embed_timeout_seconds = float(os.environ.get("MM_AGENT_RAG_EMBED_TIMEOUT_SECONDS", "45"))
 
         # 初始化持久化客户端。如果是首次运行，会自动创建数据库目录。
         try:
@@ -31,10 +34,6 @@ class RAGService:
             print(f"[RAG Init Error] 无法初始化 ChromaDB: {e}")
             self.collection = None
         
-        # 默认回退客户端：从环境变量加载
-        self._default_api_key = os.environ.get("GOOGLE_API_KEY")
-        self._default_client = genai.Client(api_key=self._default_api_key) if self._default_api_key else None
-
     def _get_client(self, api_key: str = None) -> genai.Client:
         """
         获取指定用户的 GenAI 客户端或使用全局默认客户端。
@@ -42,7 +41,24 @@ class RAGService:
         """
         if api_key:
             return genai.Client(api_key=api_key)
-        return self._default_client
+        return None
+
+    def _embed_content_with_timeout(self, client: genai.Client, normalized_query: str):
+        """避免 embed_content 在网络异常时阻塞数分钟，导致 WS 空闲超时。"""
+        def _call():
+            return client.models.embed_content(
+                model=self.embedding_model,
+                contents=normalized_query,
+                config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY"),
+            )
+
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            fut = pool.submit(_call)
+            return fut.result(timeout=self.embed_timeout_seconds)
+        finally:
+            # 超时后不得 wait=True，否则仍会卡在未结束的 HTTP 线程上
+            pool.shutdown(wait=False)
 
     def search(self, query_text: str, n_results: int = 3, api_key: str = None) -> list:
         """
@@ -55,19 +71,36 @@ class RAGService:
             print("[RAG Error] ChromaDB 未就绪，无法检索。")
             return []
 
+        normalized_query = extract_text_content(query_text).strip()
+        if not normalized_query:
+            print("[RAG Error] 检索入参为空，跳过检索。")
+            return []
+
         client = self._get_client(api_key)
         if not client:
             print("[RAG Error] 未提供有效的 API Key，跳过检索环节。")
             return []
 
         try:
-            # 1. 生成查询向量 (Task Type: RETRIEVAL_QUERY)
-            response = client.models.embed_content(
-                model=self.embedding_model,
-                contents=query_text,
-                config=types.EmbedContentConfig(task_type='RETRIEVAL_QUERY')
+            t0 = time.monotonic()
+            logger.info(
+                "RAG embed_content start model=%s query_len=%s timeout_s=%s",
+                self.embedding_model,
+                len(normalized_query),
+                self.embed_timeout_seconds,
             )
+            # 1. 生成查询向量 (Task Type: RETRIEVAL_QUERY)，带独立超时
+            try:
+                response = self._embed_content_with_timeout(client, normalized_query)
+            except FuturesTimeout:
+                logger.warning(
+                    "RAG embed_content timeout after %ss (network or API slow); skip RAG hits",
+                    self.embed_timeout_seconds,
+                )
+                return []
             query_vector = response.embeddings[0].values
+            t1 = time.monotonic()
+            logger.info("RAG embed_content done elapsed_ms=%s", int((t1 - t0) * 1000))
 
             # 2. 从向量库检索 Top-K 结果
             results = self.collection.query(
@@ -93,9 +126,10 @@ class RAGService:
                     "images": img_paths
                 })
             
+            logger.info("RAG chroma query done hits=%s elapsed_total_ms=%s", len(formatted_results), int((time.monotonic() - t0) * 1000))
             return formatted_results
         except Exception as e:
-            print(f"[RAG Search Runtime Error] 检索过程异常: {e}")
+            logger.warning("RAG search failed: %s", e)
             return []
 
 # 全局单例引擎

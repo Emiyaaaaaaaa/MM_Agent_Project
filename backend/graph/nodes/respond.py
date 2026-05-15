@@ -1,8 +1,8 @@
-import os
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from backend.graph.state import AgentState
+from backend.services.serialization import extract_text_content, json_safe, ensure_blocks, make_stage
 
 class RespondNode:
     """
@@ -26,16 +26,19 @@ class RespondNode:
         """执行专业回复生成逻辑"""
         shared_mem = state.get("shared_memory", {})
         messages = state["messages"]
-        context = state.get("context", "（无参考资料）")
+        context = extract_text_content(state.get("context", "（无参考资料）"))
         feedback = state.get("human_feedback", "")
         
         # 动态模型实例化 (从任务配置加载)
         api_key = shared_mem.get("api_key")
-        model_id = shared_mem.get("model_id") or "gemini-2.5-flash"
+        model_id = shared_mem.get("model_id") or "gemini-2.5-flash-lite"
         
         if not api_key:
-            print("[Warning] No API key found in shared_memory. Falling back to environment variable.")
-            api_key = os.environ.get("GOOGLE_API_KEY")
+            return {
+                "status": "REJECTED",
+                "human_feedback": "缺少任务 API Key，Respond 节点无法执行。",
+                "stage": make_stage("respond_failed_missing_api_key", "Respond Failed: Missing Task API Key"),
+            }
 
         llm = ChatGoogleGenerativeAI(
             model=model_id,
@@ -43,10 +46,11 @@ class RespondNode:
             google_api_key=api_key
         )
         
-        # 构造知识驱动提示词
+        # 构造知识驱动提示词 (转义花括号以防止 LangChain 误判为变量)
+        safe_context = context.replace("{", "{{").replace("}", "}}")
         prompt_parts = [
             ("system", self.system_prompt),
-            ("system", f"【RAG 参考背景】\n{context}")
+            ("system", f"【RAG 参考背景】\n{safe_context}")
         ]
         
         # 处理纠偏反馈
@@ -58,13 +62,18 @@ class RespondNode:
         prompt = ChatPromptTemplate.from_messages(prompt_parts)
         chain = prompt | llm
         response = await chain.ainvoke({"messages": messages})
+        response_text = extract_text_content(response)
         
-        # 存入草稿以供审批流展示
+        # 存入草稿以供审批流展示 (使用字典格式以确保序列化安全)
         return {
-            "messages": [response],
+            "messages": [{"role": "ai", "content": ensure_blocks(response_text)}],
+            "shared_memory": {
+                **shared_mem,
+                "respond_raw_content": json_safe(getattr(response, "content", None)),
+            },
             "status": "PENDING", # 进入 HITL 流程
-            "draft": response.content,
-            "current_stage": "Consultation Response Prepared"
+            "draft": ensure_blocks(response_text),
+            "stage": make_stage("respond_prepared", "Consultation Response Prepared"),
         }
 
 # 单例封装与 LangGraph 包装函数

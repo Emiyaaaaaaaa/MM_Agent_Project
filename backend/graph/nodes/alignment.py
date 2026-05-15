@@ -1,4 +1,3 @@
-import os
 import json
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -6,6 +5,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from backend.graph.state import AgentState
 from backend.services.bus import broadcast_progress
+from backend.services.serialization import extract_text_content, make_stage
 
 class SymbolEntry(BaseModel):
     symbol: str = Field(description="变量名或数学符号 (如: x_i, item_count, T_max)")
@@ -45,18 +45,24 @@ class MemoryAlignmentNode:
         messages = state.get("messages", [])
         if messages:
             for msg in reversed(messages):
-                if msg.type == "ai" and msg.content:
-                    source_text = str(msg.content)
+                msg_type = getattr(msg, "type", None)
+                if msg_type is None and isinstance(msg, dict):
+                    msg_type = msg.get("role")
+                if msg_type in {"ai", "assistant"}:
+                    source_text = extract_text_content(msg)
                     current_node_tag = "Latest AI Output"
                     break
             
         if not source_text:
-            return {"current_stage": "Alignment Pipeline Bypassed (No Source)"}
+            return {"stage": make_stage("alignment_bypassed_no_source", "Alignment Pipeline Bypassed (No Source)")}
             
         await broadcast_progress("Alignment", f"[{current_node_tag}] 溯源结束，启动全局『记忆防漂移』对齐拦截扫描表单...", 20)
         
-        api_key = shared_mem.get("api_key") or os.environ.get("GOOGLE_API_KEY")
+        api_key = shared_mem.get("api_key")
         model_id = shared_mem.get("model_id") or "gemini-2.5-flash"
+        if not api_key:
+            await broadcast_progress("Alignment", "缺少任务 API Key，跳过本次对齐抽取。", 100)
+            return {"stage": make_stage("alignment_failed_missing_api_key", "Alignment Failed: Missing Task API Key")}
 
         # 使用低温度提取模型，使用结构化输出
         llm = ChatGoogleGenerativeAI(
@@ -74,6 +80,8 @@ class MemoryAlignmentNode:
         
         try:
             extraction = await llm.ainvoke(messages)
+            if extraction is None:
+                extraction = AlignmentRecord(symbols=[], assumptions=[], objectives=[])
             
             # --- 历史账本 Merge 策略 ---
             existing_record = shared_mem.get("alignment_record", {"symbols": [], "assumptions": [], "objectives": []})
@@ -84,14 +92,17 @@ class MemoryAlignmentNode:
             
             sym_dict = {item.get('symbol'): item for item in existing_record.get('symbols', [])}
             # 更新/增加符号
-            for s in extraction.symbols:
+            extracted_symbols = extraction.symbols or []
+            for s in extracted_symbols:
+                if not s or not getattr(s, "symbol", None):
+                    continue
                 sym_dict[s.symbol] = {"symbol": s.symbol, "meaning": s.meaning, "unit": s.unit}
                 
             assumptions_set = set(existing_record.get('assumptions', []))
-            assumptions_set.update(extraction.assumptions)
+            assumptions_set.update(extraction.assumptions or [])
             
             objectives_set = set(existing_record.get('objectives', []))
-            objectives_set.update(extraction.objectives)
+            objectives_set.update(extraction.objectives or [])
             
             new_record = {
                 "symbols": list(sym_dict.values()),
@@ -106,12 +117,12 @@ class MemoryAlignmentNode:
             
             return {
                 "shared_memory": new_memory,
-                "current_stage": f"Alignment Middleware Updated (via {current_node_tag})"
+                "stage": make_stage("alignment_updated", f"Alignment Middleware Updated (via {current_node_tag})"),
             }
             
         except Exception as e:
             print(f"[Alignment Error] 结构化析出时遭遇失败, {e}")
             await broadcast_progress("Alignment", f"对齐日志抽取失败，跳过本次存档...", 100)
-            return {"current_stage": "Alignment Failed"}
+            return {"stage": make_stage("alignment_failed", "Alignment Failed")}
 
 alignment_node = MemoryAlignmentNode()

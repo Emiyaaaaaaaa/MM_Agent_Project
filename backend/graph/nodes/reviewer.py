@@ -5,6 +5,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from backend.graph.state import AgentState
 from backend.services.bus import broadcast_progress
+from backend.services.serialization import extract_text_content, json_safe, ensure_blocks, make_stage
 
 class ReviewerNode:
     """
@@ -18,9 +19,9 @@ class ReviewerNode:
             "重点打击：\n"
             "1. 数学假设不合理，或者推导出现明显跳跃。\n"
             "2. 代码逻辑错位、数值可能溢出或算法选择极度劣势。\n"
-            "3. 运行输出日志与文本结论相违背，或图不达意（坐标轴、标题严重缺失）。\n"
             "4. 记忆漂移(Drift)：检查代码与公式的符号是否割裂（如公式用X，代码用Y），或代码擅自添加了《全局预设假设》中不允许的考虑因素。\n"
-            "不要进行任何客套和赞美，直接列出所有痛点和致命雷区，生成一份火力全开的《攻击报告》。"
+            "不要进行任何客套和赞美，直接列出所有痛点和致命雷区，生成一份火力全开的《攻击报告》。\n"
+            "【文风强制要求】：语言和文字风格要符合各个获奖论文严谨冷静的范式，不要使用对表达论文内容来说不必要的比喻以及其他修辞，也不要使用过于抽象的合成词语或者自造词语"
         )
         
         self.defender_prompt = (
@@ -30,7 +31,8 @@ class ReviewerNode:
             "1. 对于合理的学术简化或为了模型收敛而做出的妥协，给出强有力的学术术语进行理论辩护。\n"
             "2. 澄清对方可能因为未详读原始代码而产生的误解。\n"
             "3. 如果对方指出了真正无法辩驳的硬伤（如明显且致命的代码错误、自相矛盾的数据点），果断承认失误。\n"
-            "生成一份理据充分的、守护心血结晶的《答辩报告》。"
+            "生成一份理据充分的、守护心血结晶的《答辩报告》。\n"
+            "【文风强制要求】：语言和文字风格要符合各个获奖论文严谨冷静的范式，不要使用对表达论文内容来说不必要的比喻以及其他修辞，也不要使用过于抽象的合成词语或者自造词语"
         )
         
         self.judge_prompt = (
@@ -42,6 +44,9 @@ class ReviewerNode:
             "2. 提炼真正影响模型可用性的有效缺陷，生成一份庄重、中立、直指盲证的《官方综合审查意见》。\n"
             "3. 如果存在必须修复的红牌硬伤，务必明确在结论段给出具体的“回滚与修复指令清单”（例如：建议退回 Coder 节点重写算法架构）。\n"
             "4. 版权红线底限：审查报告中绝对不允许提及任何 RAG 参考资料中的队号、年份或特定 O 奖头衔，必须统一以‘顶尖赛事通行学术标准’的宏大叙事面貌展示。\n"
+            "5. 图表覆盖度核查：必须检查 `Fusion 图表计划` 与 `Coder 实际产物` 是否一致，"
+            "并检查论文正文是否引用并解释了关键图表。若不一致，必须给出退回修复指令。\n"
+            "【文风强制要求】：语言和文字风格要符合各个获奖论文严谨冷静的范式，不要使用对表达论文内容来说不必要的比喻以及其他修辞，也不要使用过于抽象的合成词语或者自造词语"
         )
 
     def _get_image_data(self, file_path):
@@ -54,10 +59,13 @@ class ReviewerNode:
     async def __call__(self, state: AgentState):
         """执行流式多模态三元辩论审查"""
         shared_mem = state.get("shared_memory", {})
-        analysis = shared_mem.get("analysis_report", "")
-        model_doc = shared_mem.get("mathematical_model", "")
-        code = shared_mem.get("generated_code", "")
+        analysis = extract_text_content(shared_mem.get("analysis_report", ""))
+        model_doc = extract_text_content(shared_mem.get("mathematical_model", ""))
+        code = extract_text_content(shared_mem.get("generated_code", ""))
         execution_logs = shared_mem.get("execution_logs", {})
+        fusion_chart_plan = shared_mem.get("fusion_chart_plan", [])
+        artifacts_manifest = shared_mem.get("artifacts_manifest", [])
+        paper_draft_text = extract_text_content(shared_mem.get("paper_draft", ""))
         
         await broadcast_progress("Review", "[1/4] 资源锁定：正在抽取并组装全链路原始文稿素材视界...", 10)
         
@@ -80,6 +88,12 @@ class ReviewerNode:
         if execution_logs:
             stdout_data = execution_logs.get('stdout', '')
             base_material_text += f"【4. 代码标准运行时反射区】\n{stdout_data[:1500]}\n\n"
+        if isinstance(fusion_chart_plan, list):
+            base_material_text += f"【5. Fusion 图表计划】\n{json.dumps(fusion_chart_plan, ensure_ascii=False)[:2200]}\n\n"
+        if isinstance(artifacts_manifest, list):
+            base_material_text += f"【6. Coder 实际图表/产物】\n{json.dumps(artifacts_manifest, ensure_ascii=False)[:2200]}\n\n"
+        if paper_draft_text:
+            base_material_text += f"【7. 论文正文图表引用节选】\n{paper_draft_text[:2200]}\n\n"
         
         rag_context = state.get("context", "")
         if rag_context:
@@ -95,8 +109,14 @@ class ReviewerNode:
         base_content = [{"type": "text", "text": base_material_text}] + images
         
         # 建立网络连线心跳
-        api_key = shared_mem.get("api_key") or os.environ.get("GOOGLE_API_KEY")
-        model_id = shared_mem.get("model_id") or "gemini-2.5-flash"
+        api_key = shared_mem.get("api_key")
+        model_id = shared_mem.get("model_id") or "gemini-2.5-flash-lite"
+        if not api_key:
+            return {
+                "status": "REJECTED",
+                "human_feedback": "缺少任务 API Key，Review 节点无法执行。",
+                "stage": make_stage("review_failed_missing_api_key", "Review Failed: Missing Task API Key"),
+            }
 
         # 辩手模型（微高温度刺激跳跃性思维）
         debater_llm = ChatGoogleGenerativeAI(
@@ -114,7 +134,7 @@ class ReviewerNode:
             HumanMessage(content=base_content)
         ]
         critique_response = await debater_llm.ainvoke(critique_msg)
-        critique_report = critique_response.content
+        critique_report = extract_text_content(critique_response)
         
         # =======================
         # Round 2: Defender (蓝方防守)
@@ -130,7 +150,7 @@ class ReviewerNode:
             HumanMessage(content=[{"type": "text", "text": defender_text}] + images)
         ]
         defender_response = await debater_llm.ainvoke(defender_msg)
-        defense_report = defender_response.content
+        defense_report = extract_text_content(defender_response)
         
         # =======================
         # Round 3: Judge (主板裁决)
@@ -156,7 +176,7 @@ class ReviewerNode:
             HumanMessage(content=[{"type": "text", "text": judge_text}] + images)
         ]
         judge_response = await judge_llm.ainvoke(judge_msg)
-        final_review = judge_response.content
+        final_review = extract_text_content(judge_response)
         
         await broadcast_progress("Review", "辩论式逻辑审查体系运作顺利流转毕，已封印综合意见卷底。", 100)
         
@@ -164,13 +184,18 @@ class ReviewerNode:
         new_memory["review_report"] = final_review
         # 溯源日志防丢失
         new_memory["review_debate_logs"] = f"【The Critique Report】\n{critique_report}\n\n【The Defender Report】\n{defense_report}"
+        new_memory["review_raw_content"] = {
+            "critique": json_safe(getattr(critique_response, "content", None)),
+            "defense": json_safe(getattr(defender_response, "content", None)),
+            "judge": json_safe(getattr(judge_response, "content", None)),
+        }
         
         return {
-            "messages": [judge_response], 
+            "messages": [{"role": "ai", "content": ensure_blocks(final_review)}],
             "shared_memory": new_memory,
             "status": "PENDING", # 此处中断交与业务人类复裁
-            "draft": final_review,
-            "current_stage": "Debate-Style Review Completed"
+            "draft": ensure_blocks(final_review),
+            "stage": make_stage("review_completed", "Debate-Style Review Completed"),
         }
 
 reviewer_node = ReviewerNode()
