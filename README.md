@@ -1,128 +1,88 @@
-# 🏛️ MCM/ICM Multi-Modal RAG Agent
-### O 奖级数学建模全自动专家系统
+# MCM/ICM Mathematical Modeling Agent
 
-[![Stack](https://img.shields.io/badge/Stack-LangGraph%20%7C%20Gemini%20%7C%20FastAPI-blue?style=for-the-badge)](https://github.com/google/generative-ai)
-[![Framework](https://img.shields.io/badge/Framework-LangChain-green?style=for-the-badge)](https://langchain.com)
+面向数学建模竞赛（MCM/ICM）场景的工程化智能体系统。  
+目标是帮助用户完成从赛题理解到论文交付的全流程工作，而不仅是生成零散答案。
 
-基于 **LangGraph** 与 **Gemini 2.5 Flash** 深度定制的数学建模竞赛 (MCM/ICM) 辅助生成智能体。系统集成了多模态解析、动态路由调度、学术知识融合以及具备自愈能力的编程沙箱，旨在为复杂建模任务提供端到端的自动化解决方案。
+## 1. 核心功能
 
----
+### 1.1 竞赛任务全流程自动化
+- 支持从题目输入到论文导出的端到端流程：`Reader -> Fusion -> Analyzer -> Modeler -> Coder -> Reviewer -> Writer -> Exporter`。
+- 支持同任务内重启（清空消息 + 清空图检查点），避免历史状态污染。
+- 支持 WebSocket 实时过程回传与阶段可观测。
 
-## 🔥 核心引擎能力 (Engine Capabilities)
+### 1.2 结构化协议驱动
+- 后端节点产出、WS 事件、历史消息统一采用 `ContentBlock[] + stage`。
+- 前端按块级类型渲染（text/markdown/code/math/image/table），减少字符串拼接与渲染歧义。
+- 支持产物清单协议（`artifact_manifest`）表达多图、多文件导出。
 
-- **智能意图分发 (Supervisor Logic)**：系统大脑能根据用户意图，自动在“即席咨询”、“单阶段任务”与“全链路流水线任务”之间进行路由切换。
-- **双轨知识融合检索 (Knowledge Fusion)**：
-    - **本地 RAG**：深度检索历年 O 奖论文向量库，提取高价值学术方法论。
-    - **Web Grounding**：实时调用 Google Search 补充物理世界最新数据，解决数据时效性痛点。
-- **原子级状态一致性 (Reliability)**：底层采用有状态图（Stateful Graph）设计，支持 Checkpointer 恢复，确保在复杂逻辑分支下状态不丢失。
-- **任务内重置 (In-task Restart)**：支持在同一任务下“一键重新开始”，清空任务消息与图状态检查点，避免历史状态污染新一轮推理。
-- **纯结构化协议 (Structured-First Contract)**：
-    - 后端节点产物、WS 事件、历史消息回放统一输出 `ContentBlock[]` + `stage`。
-    - 前端采用块级渲染组件，不再依赖单一字符串/`v-html` 渲染主链路。
-- **模型空输出自愈 (Modeler Self-Healing)**：
-    - 对 `Modeling` 节点新增空输出重试与模型降级兜底（同模型重试 -> 2.5 Flash Lite 回退）。
-    - 增强原始响应诊断日志（finish_reason、candidate_count、block_reason 等）便于定位。
-- **受控依赖安装 (Controlled Auto-Install)**：
-    - Coder 沙箱可在白名单内自动安装缺失库并重跑一次（`numpy/pandas/matplotlib/seaborn/scikit-learn/scipy/pulp`）。
-    - 默认提示词引导优先使用 `numpy/pandas`，减少 `scipy` 依赖导致的执行失败。
-- **多角色专家矩阵**：
-    - **Prompt Engineer**: 负责全局任务拆解与指令优化。
-    - **Modeler Node**: 产出规范的数学描述与符号体系。
-    - **Coder Node**: Python 数据工程与图表生成，具备自动 Debug 闭环。
-    - **Reviewer Node**: 逻辑校验与论文对齐审计。
+### 1.3 建模与写作闭环
+- Modeler 节点具备空输出重试与模型回退机制，降低流程中断概率。
+- Coder 节点支持受控依赖自动安装（白名单）并重试一次，提升可执行率。
+- Writer 节点按章节组织论文内容，结合上游分析与图表产物输出完整草稿。
+- Exporter 支持论文与产物导出，形成可交付结果包。
 
----
+### 1.4 数据与状态可靠性
+- 基于 LangGraph + checkpoint 的有状态执行，支持恢复与重入。
+- 数据层已落地软删除、字段兼容补齐与 SQLite 约束迁移方案（含回滚路径）。
+- 后端具备请求/事件日志能力，便于定位链路问题。
 
-## 🏗️ 系统架构拓扑 (System Topology)
+## 2. 与现有开源“MM-Agent：面向真实世界数学建模问题的智能体”的差异
 
-```mermaid
-graph TD
-    subgraph "客户端 (Client Side)"
-        UI[Vue3 专业工作台] <--> Bus[WS 数据总线]
-    end
+本项目的定位更加偏向可落地交付，强调“帮助用户完成竞赛论文”的业务闭环。
 
-    subgraph "后端大脑 (Backend Engine)"
-        SV[Supervisor 调度器]
-        FN[Fusion 知识检索]
-        AZ[Analysis 分阶段节点]
-        MD[Modeling 建模节点]
-        CD[Coder 编程沙箱]
-        WT[Writer 论文生成]
-        
-        SV --> FN
-        FN --> SV
-        SV --> AZ --> MD --> CD --> WT
-    end
+- **目标差异**：不仅解决建模问题，还强调最终论文交付（结构化过程 + 多产物导出 + 可回放）。
+- **场景差异**：更聚焦具体数学建模竞赛任务（MCM/ICM）与竞赛文档产出要求。
+- **工程差异**：强化了任务重启、结构化协议、数据库迁移、日志可观测、失败自愈与回滚机制。
+- **产品化取向**：更关注可维护性、可验收性与可持续迭代，而不仅是模型效果展示。
 
-    subgraph "持久化与数据源"
-        DB[(ChromaDB 知识库)]
-        Checkpoint[(SQLite 检查点)]
-        Static[Static Assets]
-    end
+## 3. 技术架构与选型
 
-    Bus <--> SV
-    FN <--> DB
-    SV <--> Checkpoint
-    WT --> Static
-```
+### 3.1 技术栈
+- 前端：Vue 3 + Vite + Pinia + Naive UI
+- 后端：FastAPI + LangGraph + LangChain
+- 模型：Gemini 系列
+- 存储：
+  - SQLite（用户、任务、消息、检查点）
+  - ChromaDB（本地 RAG 向量检索）
 
----
+### 3.2 选型理由
+- **FastAPI**：HTTP/WS 双通道开发效率高，类型与依赖注入友好。
+- **LangGraph**：适配多节点、有状态、可恢复的编排需求。
+- **SQLite + ChromaDB**：本地部署成本低，适合竞赛开发与快速迭代。
+- **Vue3 + Pinia**：适配事件驱动 UI 与状态集中管理。
 
-## 🚀 快速启动指南 (Getting Started)
+## 4. 模型路线与后续模式
 
-### 1. 环境准备
-确保您的开发环境已安装 **Python 3.11+** 和 **Node.js 18+**。
+- 当前主模型路线为 **Gemini**（含不同任务阶段的模型分配与回退策略）。
+- 后续将新增一个模式：基于 **Gemini Deep Research** 的研究型写作流程。
+  - 目标是将论文写作流程做得更工程化、更可追踪、更接近成熟交付标准。
+  - 重点提升文献整合、论证链条一致性和章节级可控生成能力。
 
-### 2. 后端部署
+## 5. 快速启动
+
+### 5.1 环境要求
+- Python 3.11+
+- Node.js 18+
+
+### 5.2 后端
 ```bash
-# 复制项目并安装依赖
 poetry install
-
-# 配置环境变量 (创建 .env 文件)
-GOOGLE_API_KEY="您的 Gemini API 密钥"
-```
-
-启动后端服务：
-```bash
 poetry run python -m backend.main
 ```
 
-### 3. 前端启动
+### 5.3 前端
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
 
----
+## 6. 协议与文档
 
-## 📝 核心业务流程 (Workflow)
+- API/WS 契约：`docs/api_contract.md`
+- 面试与问题复盘文档：`docs/interview/`
 
-1.  **赛题读取 (Read)**：通过 Gemini Vision 能力解析包含图表的 PDF/图片赛题。
-2.  **知识注入 (Retrieve)**：检索历史 O 奖建模思路并调研实时客观数据。
-3.  **审题分析 (Analyze)**：挖掘隐含约束，建立全局一致的符号表。
-4.  **数学推导 (Model)**：生成 Latex 格式的核心公式与模型描述。
-5.  **仿真验证 (Code)**：生成并执行 Python 代码，产出 Seaborn 图表。
-6.  **论文撰写 (Write)**：整合前序所有成果，产出高水平学术论文草稿。
+## 7. 说明
 
----
-
-## 📡 结构化通信说明（关键变更）
-
-- WS `FINAL`：`payload.blocks + payload.stage`
-- WS `INTERMEDIATE`：`summary_blocks + preview_blocks + stage + ask_continue`
-- WS `PROGRESS/STATUS/ERROR`：统一结构化 `payload.blocks`
-- 历史消息接口：返回 `content_blocks`（并保留 `content_text` 便于调试）
-
-详见：`docs/api_contract.md`
-
----
-
-## 📂 资源导出说明
-
-- **全量产出包**: `backend/static/exports/final_submission.zip`
-- **论文草稿**: `thesis.md` & `thesis.tex`
-- **数据图表**: `backend/static/plots/`
-
----
-*Powered by Antigravity Digital Orchestration. 2026.*
+- 运行时大文件（数据库、日志、导出图表）默认不纳入版本控制。
+- 数据库迁移脚本位于 `backend/db/migrations/`，包含执行入口与回滚说明。
