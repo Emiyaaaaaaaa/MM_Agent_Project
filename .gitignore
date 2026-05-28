@@ -34,5 +34,7 @@ tmp/
 logs/
 *.log
 
+rag_service/tests/
+rag_service/convert_papers_colab.py
 
 docs/interview/
