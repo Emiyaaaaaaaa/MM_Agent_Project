@@ -36,5 +36,10 @@ logs/
 
 rag_service/tests/
 rag_service/convert_papers_colab.py
+backend/debug_api.py
+backend/verify_viz_execution.py
+backend/graph/test_*.py
+backend/test_*.py
+rag_service/query_test.py
 
 docs/interview/
