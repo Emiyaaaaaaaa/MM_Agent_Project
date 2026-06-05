@@ -121,7 +121,7 @@ class ModelerNode:
         
         # 2. 动态模型实例化 (从任务配置加载)
         api_key = shared_mem.get("api_key")
-        model_id = shared_mem.get("model_id") or "gemini-2.5-flash-lite"
+        model_id = shared_mem.get("model_id") or "gemini-3.1-flash-lite"
         
         if not api_key:
             return {
@@ -144,7 +144,7 @@ class ModelerNode:
         ]
         fusion_guidance = extract_text_content(shared_mem.get("fusion_guidance", "")) or extract_text_content(state.get("context", ""))
         if fusion_guidance:
-            safe_fusion = fusion_guidance[:3800].replace("{", "{{").replace("}", "}}")
+            safe_fusion = fusion_guidance[:2200].replace("{", "{{").replace("}", "}}")
             prompt_parts.append(
                 (
                     "system",
@@ -247,7 +247,7 @@ class ModelerNode:
                 response_metadata = getattr(retry_response, "response_metadata", {}) or {}
                 logger.info("Modeling retry succeeded with model=%s length=%s", model_id, len(modeling_text))
             else:
-                fallback_model_id = "gemini-2.5-flash-lite"
+                fallback_model_id = "gemini-3.1-flash-lite"
                 if model_id != fallback_model_id:
                     logger.warning(
                         "Modeling retry still empty on model=%s, fallback to model=%s",
@@ -296,7 +296,7 @@ class ModelerNode:
         return {
             "messages": [{"role": "ai", "content": ensure_blocks(modeling_text)}],
             "shared_memory": new_memory,
-            "status": "PENDING",
+            "status": "APPROVED",
             "draft": ensure_blocks(modeling_text),
             "stage": make_stage("modeling_completed", "Mathematical Modeling Completed"),
         }

@@ -4,7 +4,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage
 from backend.graph.state import AgentState
 from backend.services.bus import broadcast_progress
-from backend.services.serialization import extract_text_content, json_safe, ensure_blocks, make_stage
+from backend.services.serialization import extract_text_content, json_safe, ensure_blocks, make_stage, messages_for_llm
 
 class AnalyzerNode:
     """
@@ -31,7 +31,18 @@ class AnalyzerNode:
     async def __call__(self, state: AgentState):
         """执行全文本审题分析逻辑"""
         shared_mem = state.get("shared_memory", {})
-        doc_content = extract_text_content(shared_mem.get("raw_document_content", "（暂无题目原文，请上传文件）"))
+        doc_content = extract_text_content(shared_mem.get("raw_document_content", "")).strip()
+        if not doc_content:
+            for msg in reversed(state.get("messages", []) or []):
+                msg_type = getattr(msg, "type", None)
+                if msg_type is None and isinstance(msg, dict):
+                    msg_type = msg.get("role")
+                if msg_type in {"human", "user"}:
+                    doc_content = extract_text_content(msg).strip()
+                    if doc_content:
+                        break
+        if not doc_content:
+            doc_content = "（暂无题目原文，请上传文件）"
         feedback = state.get("human_feedback", "")
         
         # 1. 广播进度：开始重读文档
@@ -47,11 +58,11 @@ class AnalyzerNode:
         # 如果有 RAG 背景信息，将其显式作为参考资料注入
         context = state.get("context")
         if context:
-            safe_context = context.replace("{", "{{").replace("}", "}}")
+            safe_context = extract_text_content(context)[:1800].replace("{", "{{").replace("}", "}}")
             prompt_parts.append(("system", f"【RAG 检索参考资料（严禁直接引用队号/年份）：】\n{safe_context}"))
         fusion_guidance = extract_text_content(shared_mem.get("fusion_guidance", "")) or extract_text_content(context)
         if fusion_guidance:
-            safe_fusion = fusion_guidance[:3500].replace("{", "{{").replace("}", "}}")
+            safe_fusion = fusion_guidance[:1800].replace("{", "{{").replace("}", "}}")
             prompt_parts.append(
                 (
                     "system",
@@ -61,7 +72,11 @@ class AnalyzerNode:
                 )
             )
 
-        messages = state.get("messages", [])
+        messages = messages_for_llm(
+            state.get("messages", []) or [],
+            max_messages=4,
+            max_chars_per_message=1200,
+        )
         if not messages:
             messages = [HumanMessage(content="请开始审题分析。")]
         
@@ -72,7 +87,7 @@ class AnalyzerNode:
         
         # 1.5. 动态模型实例化 (从任务配置加载)
         api_key = shared_mem.get("api_key")
-        model_id = shared_mem.get("model_id") or "gemini-2.5-flash-lite"
+        model_id = shared_mem.get("model_id") or "gemini-3.1-flash-lite"
         
         if not api_key:
             return {
@@ -109,7 +124,7 @@ class AnalyzerNode:
         return {
             "messages": [{"role": "ai", "content": ensure_blocks(analysis_text)}],
             "shared_memory": new_memory,
-            "status": "PENDING",
+            "status": "APPROVED",
             "draft": ensure_blocks(analysis_text),
             "stage": make_stage("analysis_completed", "Problem Analysis Completed"),
         }

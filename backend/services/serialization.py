@@ -1,5 +1,7 @@
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 
 def make_text_block(text: str) -> Dict[str, Any]:
@@ -132,6 +134,64 @@ def get_stage_id(stage: Any) -> str:
 
 def message_to_text(message_like: Any) -> str:
     return blocks_to_text(message_like)
+
+
+def _clip_text(text: str, max_chars: int | None = None) -> str:
+    if max_chars is None or max_chars <= 0 or len(text) <= max_chars:
+        return text
+    if max_chars <= 20:
+        return text[:max_chars]
+    head = max_chars // 2
+    tail = max_chars - head - 15
+    return f"{text[:head]}\n...[omitted]...\n{text[-tail:]}"
+
+
+def messages_for_llm(
+    messages: Sequence[Any],
+    *,
+    max_messages: int | None = None,
+    max_chars_per_message: int | None = None,
+) -> List[BaseMessage]:
+    """
+    将图状态中的 messages 转为 Gemini/OpenAI 可接受的纯文本 LangChain 消息。
+    避免 markdown/code/image 等结构化块触发 Unrecognized message part type。
+    """
+    if not messages:
+        return []
+    selected_messages = list(messages)
+    if max_messages is not None and max_messages > 0:
+        selected_messages = selected_messages[-max_messages:]
+    out: List[BaseMessage] = []
+    for msg in selected_messages:
+        if isinstance(msg, HumanMessage):
+            text = _clip_text(extract_text_content(msg.content).strip(), max_chars_per_message) or " "
+            out.append(HumanMessage(content=text))
+            continue
+        if isinstance(msg, AIMessage):
+            text = _clip_text(extract_text_content(msg.content).strip(), max_chars_per_message) or " "
+            out.append(AIMessage(content=text))
+            continue
+
+        role = ""
+        if isinstance(msg, dict):
+            role = str(msg.get("role", "") or "")
+            raw_content = msg.get("content", "")
+        else:
+            msg_type = getattr(msg, "type", None)
+            if msg_type in {"human", "user"}:
+                role = "user"
+            elif msg_type in {"ai", "assistant"}:
+                role = "ai"
+            else:
+                role = str(msg_type or "ai")
+            raw_content = getattr(msg, "content", msg)
+
+        text = _clip_text(extract_text_content(raw_content).strip(), max_chars_per_message) or " "
+        if role in {"user", "human"}:
+            out.append(HumanMessage(content=text))
+        else:
+            out.append(AIMessage(content=text))
+    return out
 
 
 def extract_final_blocks(final_state: Dict[str, Any]) -> List[Dict[str, Any]]:

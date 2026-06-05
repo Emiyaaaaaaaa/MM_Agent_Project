@@ -2,7 +2,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from backend.graph.state import AgentState
-from backend.services.serialization import extract_text_content, json_safe, ensure_blocks, make_stage
+from backend.services.serialization import extract_text_content, json_safe, ensure_blocks, make_stage, messages_for_llm
 
 class RespondNode:
     """
@@ -25,13 +25,17 @@ class RespondNode:
     async def __call__(self, state: AgentState):
         """执行专业回复生成逻辑"""
         shared_mem = state.get("shared_memory", {})
-        messages = state["messages"]
+        messages = messages_for_llm(
+            state.get("messages", []) or [],
+            max_messages=6,
+            max_chars_per_message=1200,
+        )
         context = extract_text_content(state.get("context", "（无参考资料）"))
         feedback = state.get("human_feedback", "")
         
         # 动态模型实例化 (从任务配置加载)
         api_key = shared_mem.get("api_key")
-        model_id = shared_mem.get("model_id") or "gemini-2.5-flash-lite"
+        model_id = shared_mem.get("model_id") or "gemini-3.1-flash-lite"
         
         if not api_key:
             return {
@@ -47,7 +51,7 @@ class RespondNode:
         )
         
         # 构造知识驱动提示词 (转义花括号以防止 LangChain 误判为变量)
-        safe_context = context.replace("{", "{{").replace("}", "}}")
+        safe_context = context[:2000].replace("{", "{{").replace("}", "}}")
         prompt_parts = [
             ("system", self.system_prompt),
             ("system", f"【RAG 参考背景】\n{safe_context}")
